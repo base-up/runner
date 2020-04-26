@@ -110,9 +110,9 @@ namespace GitHub.Runner.Worker.Handlers
 
             // try to resolve path inside container if the request path is part of the mount volume
 #if OS_WINDOWS
-            if (Container.MountVolumes.Exists(x => path.StartsWith(x.SourceVolumePath, StringComparison.OrdinalIgnoreCase)))
+            if (Container.MountVolumes.Exists(x => !string.IsNullOrEmpty(x.SourceVolumePath) && path.StartsWith(x.SourceVolumePath, StringComparison.OrdinalIgnoreCase)))
 #else
-            if (Container.MountVolumes.Exists(x => path.StartsWith(x.SourceVolumePath)))
+            if (Container.MountVolumes.Exists(x => !string.IsNullOrEmpty(x.SourceVolumePath) && path.StartsWith(x.SourceVolumePath)))
 #endif
             {
                 return Container.TranslateToContainerPath(path);
@@ -149,14 +149,14 @@ namespace GitHub.Runner.Worker.Handlers
                             throw new NotSupportedException(msg);
                         }
                         nodeExternal = "node12_alpine";
-                        executionContext.Output($"Container distribution is alpine. Running JavaScript Action with external tool: {nodeExternal}");
+                        executionContext.Debug($"Container distribution is alpine. Running JavaScript Action with external tool: {nodeExternal}");
                         return nodeExternal;
                     }
                 }
             }
             // Optimistically use the default
             nodeExternal = "node12";
-            executionContext.Output($"Running JavaScript Action with default external tool: {nodeExternal}");
+            executionContext.Debug($"Running JavaScript Action with default external tool: {nodeExternal}");
             return nodeExternal;
         }
 

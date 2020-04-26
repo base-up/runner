@@ -1,19 +1,21 @@
-﻿using GitHub.DistributedTask.Expressions2;
-using GitHub.DistributedTask.ObjectTemplating.Tokens;
-using GitHub.DistributedTask.Pipelines.ContextData;
-using GitHub.DistributedTask.WebApi;
-using GitHub.Runner.Common.Util;
-using GitHub.Runner.Worker;
-using GitHub.Runner.Worker.Container;
-using Moq;
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
-using System.Reflection;
+using System.Net;
+using System.Net.Http;
 using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
+using GitHub.DistributedTask.Expressions2;
+using GitHub.DistributedTask.ObjectTemplating.Tokens;
+using GitHub.DistributedTask.Pipelines.ContextData;
+using GitHub.DistributedTask.WebApi;
+using GitHub.Runner.Sdk;
+using GitHub.Runner.Worker;
+using GitHub.Runner.Worker.Container;
+using Moq;
+using Moq.Protected;
 using Xunit;
 using Pipelines = GitHub.DistributedTask.Pipelines;
 
@@ -56,7 +58,7 @@ namespace GitHub.Runner.Common.Tests.Worker
                 };
 
                 //Act
-                var steps = await _actionManager.PrepareActionsAsync(_ec.Object, actions);
+                var steps = (await _actionManager.PrepareActionsAsync(_ec.Object, actions)).ContainerSetupSteps;
 
                 //Assert
                 Assert.Equal(actionId, (steps[0].Data as ContainerSetupInfo).StepIds[0]);
@@ -114,47 +116,175 @@ namespace GitHub.Runner.Common.Tests.Worker
         [Fact]
         [Trait("Level", "L0")]
         [Trait("Category", "Worker")]
-        public async void PrepareActions_SkipDownloadActionFromGraphWhenCached_OnPremises()
+        public async void PrepareActions_DownloadBuiltInActionFromGraph_OnPremises()
         {
             try
             {
                 // Arrange
                 Setup();
-                var actionId = Guid.NewGuid();
+                const string ActionName = "actions/sample-action";
                 var actions = new List<Pipelines.ActionStep>
                 {
                     new Pipelines.ActionStep()
                     {
                         Name = "action",
-                        Id = actionId,
+                        Id = Guid.NewGuid(),
                         Reference = new Pipelines.RepositoryPathReference()
                         {
-                            Name = "actions/no-such-action",
+                            Name = ActionName,
                             Ref = "master",
                             RepositoryType = "GitHub"
                         }
                     }
                 };
-                _configurationStore.Object.GetSettings().IsHostedServer = false;
-                var actionDirectory = Path.Combine(_hc.GetDirectory(WellKnownDirectory.Actions), "actions/no-such-action", "master");
-                Directory.CreateDirectory(actionDirectory);
-                var watermarkFile = $"{actionDirectory}.completed";
-                File.WriteAllText(watermarkFile, DateTime.UtcNow.ToString());
-                var actionFile = Path.Combine(actionDirectory, "action.yml");
-                File.WriteAllText(actionFile, @"
-name: ""no-such-action""
-runs:
-  using: node12
-  main: no-such-action.js
-");
-                var testFile = Path.Combine(actionDirectory, "test-file");
-                File.WriteAllText(testFile, "asdf");
 
-                // Act
+                // Return a valid action from GHES via mock
+                const string ApiUrl = "https://ghes.example.com/api/v3";
+                string expectedArchiveLink = GetLinkToActionArchive(ApiUrl, ActionName, "master");
+                string archiveFile = await CreateRepoArchive();
+                using var stream = File.OpenRead(archiveFile);
+                var mockClientHandler = new Mock<HttpClientHandler>();
+                mockClientHandler.Protected().Setup<Task<HttpResponseMessage>>("SendAsync", ItExpr.Is<HttpRequestMessage>(m => m.RequestUri == new Uri(expectedArchiveLink)), ItExpr.IsAny<CancellationToken>())
+                    .ReturnsAsync(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StreamContent(stream) });
+
+                var mockHandlerFactory = new Mock<IHttpClientHandlerFactory>();
+                mockHandlerFactory.Setup(p => p.CreateClientHandler(It.IsAny<RunnerWebProxy>())).Returns(mockClientHandler.Object);
+                _hc.SetSingleton(mockHandlerFactory.Object);
+
+                _ec.Setup(x => x.GetGitHubContext("api_url")).Returns(ApiUrl);
+                _configurationStore.Object.GetSettings().IsHostedServer = false;
+
+                //Act
                 await _actionManager.PrepareActionsAsync(_ec.Object, actions);
 
-                // Assert
-                Assert.True(File.Exists(testFile));
+                //Assert
+                var watermarkFile = Path.Combine(_hc.GetDirectory(WellKnownDirectory.Actions), ActionName, "master.completed");
+                Assert.True(File.Exists(watermarkFile));
+
+                var actionYamlFile = Path.Combine(_hc.GetDirectory(WellKnownDirectory.Actions), ActionName, "master", "action.yml");
+                Assert.True(File.Exists(actionYamlFile));
+                _hc.GetTrace().Info(File.ReadAllText(actionYamlFile));
+            }
+            finally
+            {
+                Teardown();
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public async void PrepareActions_DownloadCommunityActionFromGraph_OnPremises()
+        {
+            try
+            {
+                // Arrange
+                Setup();
+                const string ActionName = "ownerName/sample-action";
+                const string MungedActionName = "actions-community/ownerName-sample-action";
+                var actions = new List<Pipelines.ActionStep>
+                {
+                    new Pipelines.ActionStep()
+                    {
+                        Name = "action",
+                        Id = Guid.NewGuid(),
+                        Reference = new Pipelines.RepositoryPathReference()
+                        {
+                            Name = ActionName,
+                            Ref = "master",
+                            RepositoryType = "GitHub"
+                        }
+                    }
+                };
+
+                // Return a valid action from GHES via mock
+                const string ApiUrl = "https://ghes.example.com/api/v3";
+                string builtInArchiveLink = GetLinkToActionArchive(ApiUrl, ActionName, "master");
+                string mungedArchiveLink = GetLinkToActionArchive(ApiUrl, MungedActionName, "master");
+                string archiveFile = await CreateRepoArchive();
+                using var stream = File.OpenRead(archiveFile);
+                var mockClientHandler = new Mock<HttpClientHandler>();
+                mockClientHandler.Protected().Setup<Task<HttpResponseMessage>>("SendAsync", ItExpr.Is<HttpRequestMessage>(m => m.RequestUri == new Uri(builtInArchiveLink)), ItExpr.IsAny<CancellationToken>())
+                    .ReturnsAsync(new HttpResponseMessage(HttpStatusCode.NotFound));
+                mockClientHandler.Protected().Setup<Task<HttpResponseMessage>>("SendAsync", ItExpr.Is<HttpRequestMessage>(m => m.RequestUri == new Uri(mungedArchiveLink)), ItExpr.IsAny<CancellationToken>())
+                    .ReturnsAsync(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StreamContent(stream) });
+
+                var mockHandlerFactory = new Mock<IHttpClientHandlerFactory>();
+                mockHandlerFactory.Setup(p => p.CreateClientHandler(It.IsAny<RunnerWebProxy>())).Returns(mockClientHandler.Object);
+                _hc.SetSingleton(mockHandlerFactory.Object);
+
+                _ec.Setup(x => x.GetGitHubContext("api_url")).Returns(ApiUrl);
+                _configurationStore.Object.GetSettings().IsHostedServer = false;
+
+                //Act
+                await _actionManager.PrepareActionsAsync(_ec.Object, actions);
+
+                //Assert
+                var watermarkFile = Path.Combine(_hc.GetDirectory(WellKnownDirectory.Actions), ActionName, "master.completed");
+                Assert.True(File.Exists(watermarkFile));
+
+                var actionYamlFile = Path.Combine(_hc.GetDirectory(WellKnownDirectory.Actions), ActionName, "master", "action.yml");
+                Assert.True(File.Exists(actionYamlFile));
+                _hc.GetTrace().Info(File.ReadAllText(actionYamlFile));
+            }
+            finally
+            {
+                Teardown();
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public async void PrepareActions_DownloadUnknownActionFromGraph_OnPremises()
+        {
+            try
+            {
+                // Arrange
+                Setup();
+                const string ActionName = "ownerName/sample-action";
+                var actions = new List<Pipelines.ActionStep>
+                {
+                    new Pipelines.ActionStep()
+                    {
+                        Name = "action",
+                        Id = Guid.NewGuid(),
+                        Reference = new Pipelines.RepositoryPathReference()
+                        {
+                            Name = ActionName,
+                            Ref = "master",
+                            RepositoryType = "GitHub"
+                        }
+                    }
+                };
+
+                // Return a valid action from GHES via mock
+                const string ApiUrl = "https://ghes.example.com/api/v3";
+                string archiveLink = GetLinkToActionArchive(ApiUrl, ActionName, "master");
+                string archiveFile = await CreateRepoArchive();
+                using var stream = File.OpenRead(archiveFile);
+                var mockClientHandler = new Mock<HttpClientHandler>();
+                mockClientHandler.Protected().Setup<Task<HttpResponseMessage>>("SendAsync", ItExpr.IsAny<HttpRequestMessage>(), ItExpr.IsAny<CancellationToken>())
+                    .ReturnsAsync(new HttpResponseMessage(HttpStatusCode.NotFound));
+
+                var mockHandlerFactory = new Mock<IHttpClientHandlerFactory>();
+                mockHandlerFactory.Setup(p => p.CreateClientHandler(It.IsAny<RunnerWebProxy>())).Returns(mockClientHandler.Object);
+                _hc.SetSingleton(mockHandlerFactory.Object);
+
+                _ec.Setup(x => x.GetGitHubContext("api_url")).Returns(ApiUrl);
+                _configurationStore.Object.GetSettings().IsHostedServer = false;
+
+                //Act
+                Func<Task> action = async () => await _actionManager.PrepareActionsAsync(_ec.Object, actions);
+
+                //Assert
+                await Assert.ThrowsAsync<ActionNotFoundException>(action);
+
+                var watermarkFile = Path.Combine(_hc.GetDirectory(WellKnownDirectory.Actions), ActionName, "master.completed");
+                Assert.False(File.Exists(watermarkFile));
+
+                var actionYamlFile = Path.Combine(_hc.GetDirectory(WellKnownDirectory.Actions), ActionName, "master", "action.yml");
+                Assert.False(File.Exists(actionYamlFile));
             }
             finally
             {
@@ -217,7 +347,7 @@ runs:
                 };
 
                 //Act
-                var steps = await _actionManager.PrepareActionsAsync(_ec.Object, actions);
+                var steps = (await _actionManager.PrepareActionsAsync(_ec.Object, actions)).ContainerSetupSteps;
 
                 Assert.True(steps.Count == 0);
             }
@@ -256,7 +386,7 @@ runs:
                 var actionDir = Path.Combine(_hc.GetDirectory(WellKnownDirectory.Actions), "TingluoHuang", "runner_L0", "repositoryactionwithdockerfile");
 
                 //Act
-                var steps = await _actionManager.PrepareActionsAsync(_ec.Object, actions);
+                var steps = (await _actionManager.PrepareActionsAsync(_ec.Object, actions)).ContainerSetupSteps;
                 Assert.Equal(actionId, (steps[0].Data as ContainerSetupInfo).StepIds[0]);
                 Assert.Equal(actionDir, (steps[0].Data as ContainerSetupInfo).Container.WorkingDirectory);
                 Assert.Equal(Path.Combine(actionDir, "Dockerfile"), (steps[0].Data as ContainerSetupInfo).Container.Dockerfile);
@@ -296,7 +426,7 @@ runs:
                 var actionDir = Path.Combine(_hc.GetDirectory(WellKnownDirectory.Actions), "TingluoHuang", "runner_L0", "repositoryactionwithdockerfileinrelativepath");
 
                 //Act
-                var steps = await _actionManager.PrepareActionsAsync(_ec.Object, actions);
+                var steps = (await _actionManager.PrepareActionsAsync(_ec.Object, actions)).ContainerSetupSteps;
 
                 Assert.Equal(actionId, (steps[0].Data as ContainerSetupInfo).StepIds[0]);
                 Assert.Equal(actionDir, (steps[0].Data as ContainerSetupInfo).Container.WorkingDirectory);
@@ -335,7 +465,7 @@ runs:
 
                 var actionDir = Path.Combine(_hc.GetDirectory(WellKnownDirectory.Actions), "TingluoHuang", "runner_L0", "repositoryactionwithdockerfileinrelativepath");
                 //Act
-                var steps = await _actionManager.PrepareActionsAsync(_ec.Object, actions);
+                var steps = (await _actionManager.PrepareActionsAsync(_ec.Object, actions)).ContainerSetupSteps;
 
                 Assert.Equal(actionId, (steps[0].Data as ContainerSetupInfo).StepIds[0]);
                 Assert.Equal(actionDir, (steps[0].Data as ContainerSetupInfo).Container.WorkingDirectory);
@@ -375,7 +505,7 @@ runs:
                 var actionDir = Path.Combine(_hc.GetDirectory(WellKnownDirectory.Actions), "TingluoHuang", "runner_L0", "RepositoryActionWithActionfile_DockerfileRelativePath");
 
                 //Act
-                var steps = await _actionManager.PrepareActionsAsync(_ec.Object, actions);
+                var steps = (await _actionManager.PrepareActionsAsync(_ec.Object, actions)).ContainerSetupSteps;
 
                 Assert.Equal(actionId, (steps[0].Data as ContainerSetupInfo).StepIds[0]);
                 Assert.Equal(actionDir, (steps[0].Data as ContainerSetupInfo).Container.WorkingDirectory);
@@ -415,7 +545,7 @@ runs:
                 var actionDir = Path.Combine(_hc.GetDirectory(WellKnownDirectory.Actions), "TingluoHuang", "runner_L0", "RepositoryActionWithActionfile_DockerHubImage");
 
                 //Act
-                var steps = await _actionManager.PrepareActionsAsync(_ec.Object, actions);
+                var steps = (await _actionManager.PrepareActionsAsync(_ec.Object, actions)).ContainerSetupSteps;
 
                 Assert.Equal(actionId, (steps[0].Data as ContainerSetupInfo).StepIds[0]);
                 Assert.Equal("ubuntu:18.04", (steps[0].Data as ContainerSetupInfo).Container.Image);
@@ -454,7 +584,7 @@ runs:
                 var actionDir = Path.Combine(_hc.GetDirectory(WellKnownDirectory.Actions), "TingluoHuang", "runner_L0", "RepositoryActionWithActionYamlFile_DockerHubImage");
 
                 //Act
-                var steps = await _actionManager.PrepareActionsAsync(_ec.Object, actions);
+                var steps = (await _actionManager.PrepareActionsAsync(_ec.Object, actions)).ContainerSetupSteps;
 
                 Assert.Equal((steps[0].Data as ContainerSetupInfo).StepIds[0], actionId);
                 Assert.Equal("ubuntu:18.04", (steps[0].Data as ContainerSetupInfo).Container.Image);
@@ -493,7 +623,7 @@ runs:
                 var actionDir = Path.Combine(_hc.GetDirectory(WellKnownDirectory.Actions), "TingluoHuang", "runner_L0", "repositoryactionwithactionfileanddockerfile");
 
                 //Act
-                var steps = await _actionManager.PrepareActionsAsync(_ec.Object, actions);
+                var steps = (await _actionManager.PrepareActionsAsync(_ec.Object, actions)).ContainerSetupSteps;
 
                 Assert.Equal(actionId, (steps[0].Data as ContainerSetupInfo).StepIds[0]);
                 Assert.Equal(actionDir, (steps[0].Data as ContainerSetupInfo).Container.WorkingDirectory);
@@ -610,7 +740,7 @@ runs:
                 };
 
                 //Act
-                var steps = await _actionManager.PrepareActionsAsync(_ec.Object, actions);
+                var steps = (await _actionManager.PrepareActionsAsync(_ec.Object, actions)).ContainerSetupSteps;
 
                 //Assert
                 Assert.Equal(actionId1, (steps[0].Data as ContainerSetupInfo).StepIds[0]);
@@ -671,10 +801,108 @@ runs:
                 };
 
                 //Act
-                var steps = await _actionManager.PrepareActionsAsync(_ec.Object, actions);
+                var steps = (await _actionManager.PrepareActionsAsync(_ec.Object, actions)).ContainerSetupSteps;
 
                 // node.js based action doesn't need any extra steps to build/pull containers.
                 Assert.True(steps.Count == 0);
+            }
+            finally
+            {
+                Teardown();
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public async void PrepareActions_RepositoryActionWithInvalidWrapperActionfile_Node()
+        {
+            try
+            {
+                //Arrange
+                Setup();
+                var actionId = Guid.NewGuid();
+                var actions = new List<Pipelines.ActionStep>
+                {
+                    new Pipelines.ActionStep()
+                    {
+                        Name = "action",
+                        Id = actionId,
+                        Reference = new Pipelines.RepositoryPathReference()
+                        {
+                            Name = "TingluoHuang/runner_L0",
+                            Ref = "RepositoryActionWithInvalidWrapperActionfile_Node",
+                            RepositoryType = "GitHub"
+                        }
+                    }
+                };
+
+                //Act
+                try
+                {
+                    await _actionManager.PrepareActionsAsync(_ec.Object, actions);
+                }
+                catch (ArgumentException)
+                {
+                    var traceFile = Path.GetTempFileName();
+                    File.Copy(_hc.TraceFileName, traceFile, true);
+                    Assert.Contains("Entry javascript file is not provided.", File.ReadAllText(traceFile));
+                }
+            }
+            finally
+            {
+                Teardown();
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
+        public async void PrepareActions_RepositoryActionWithWrapperActionfile_PreSteps()
+        {
+            try
+            {
+                //Arrange
+                Setup();
+
+                _hc.EnqueueInstance<IActionRunner>(new Mock<IActionRunner>().Object);
+                _hc.EnqueueInstance<IActionRunner>(new Mock<IActionRunner>().Object);
+
+                var actionId1 = Guid.NewGuid();
+                var actionId2 = Guid.NewGuid();
+                _hc.GetTrace().Info(actionId1);
+                _hc.GetTrace().Info(actionId2);
+                var actions = new List<Pipelines.ActionStep>
+                {
+                    new Pipelines.ActionStep()
+                    {
+                        Name = "action1",
+                        Id = actionId1,
+                        Reference = new Pipelines.RepositoryPathReference()
+                        {
+                            Name = "TingluoHuang/runner_L0",
+                            Ref = "RepositoryActionWithWrapperActionfile_Node",
+                            RepositoryType = "GitHub"
+                        }
+                    },
+                    new Pipelines.ActionStep()
+                    {
+                        Name = "action2",
+                        Id = actionId2,
+                        Reference = new Pipelines.RepositoryPathReference()
+                        {
+                            Name = "TingluoHuang/runner_L0",
+                            Ref = "RepositoryActionWithWrapperActionfile_Docker",
+                            RepositoryType = "GitHub"
+                        }
+                    }
+                };
+
+                //Act
+                var preResult = await _actionManager.PrepareActionsAsync(_ec.Object, actions);
+                Assert.Equal(2, preResult.PreStepTracker.Count);
+                Assert.NotNull(preResult.PreStepTracker[actionId1]);
+                Assert.NotNull(preResult.PreStepTracker[actionId2]);
             }
             finally
             {
@@ -764,7 +992,7 @@ runs:
 name: 'Hello World'
 description: 'Greet the world and record the time'
 author: 'GitHub'
-inputs: 
+inputs:
   greeting: # id of input
     description: 'The greeting we choose - will print ""{greeting}, World!"" on stdout'
     required: true
@@ -864,7 +1092,7 @@ runs:
 name: 'Hello World'
 description: 'Greet the world and record the time'
 author: 'GitHub'
-inputs: 
+inputs:
   greeting: # id of input
     description: 'The greeting we choose - will print ""{greeting}, World!"" on stdout'
     required: true
@@ -963,7 +1191,7 @@ runs:
 name: 'Hello World'
 description: 'Greet the world and record the time'
 author: 'GitHub'
-inputs: 
+inputs:
   greeting: # id of input
     description: 'The greeting we choose - will print ""{greeting}, World!"" on stdout'
     required: true
@@ -1031,7 +1259,7 @@ runs:
 name: 'Hello World'
 description: 'Greet the world and record the time'
 author: 'GitHub'
-inputs: 
+inputs:
   greeting: # id of input
     description: 'The greeting we choose - will print ""{greeting}, World!"" on stdout'
     required: true
@@ -1113,7 +1341,7 @@ runs:
 name: 'Hello World'
 description: 'Greet the world and record the time'
 author: 'GitHub'
-inputs: 
+inputs:
   greeting: # id of input
     description: 'The greeting we choose - will print ""{greeting}, World!"" on stdout'
     required: true
@@ -1212,7 +1440,7 @@ runs:
 name: 'Hello World'
 description: 'Greet the world and record the time'
 author: 'GitHub'
-inputs: 
+inputs:
   greeting: # id of input
     description: 'The greeting we choose - will print ""{greeting}, World!"" on stdout'
     required: true
@@ -1310,7 +1538,7 @@ runs:
 name: 'Hello World'
 description: 'Greet the world and record the time'
 author: 'GitHub'
-inputs: 
+inputs:
   greeting: # id of input
     description: 'The greeting we choose - will print ""{greeting}, World!"" on stdout'
     required: true
@@ -1378,7 +1606,7 @@ runs:
 name: 'Hello World'
 description: 'Greet the world and record the time'
 author: 'GitHub'
-inputs: 
+inputs:
   greeting: # id of input
     description: 'The greeting we choose - will print ""{greeting}, World!"" on stdout'
     required: true
@@ -1426,7 +1654,7 @@ runs:
 
                 Assert.NotNull((definition.Data.Execution as NodeJSActionExecutionData));
                 Assert.Equal("task.js", (definition.Data.Execution as NodeJSActionExecutionData).Script);
-                Assert.Equal("cleanup.js", (definition.Data.Execution as NodeJSActionExecutionData).Cleanup);
+                Assert.Equal("cleanup.js", (definition.Data.Execution as NodeJSActionExecutionData).Post);
             }
             finally
             {
@@ -1449,7 +1677,7 @@ runs:
 name: 'Hello World'
 description: 'Greet the world and record the time'
 author: 'GitHub'
-inputs: 
+inputs:
   greeting: # id of input
     description: 'The greeting we choose - will print ""{greeting}, World!"" on stdout'
     required: true
@@ -1506,7 +1734,7 @@ runs:
                 Assert.NotNull((definition.Data.Execution as ContainerActionExecutionData)); // execution.Node
                 Assert.Equal("image:1234", (definition.Data.Execution as ContainerActionExecutionData).Image);
                 Assert.Equal("main.sh", (definition.Data.Execution as ContainerActionExecutionData).EntryPoint);
-                Assert.Equal("cleanup.sh", (definition.Data.Execution as ContainerActionExecutionData).Cleanup);
+                Assert.Equal("cleanup.sh", (definition.Data.Execution as ContainerActionExecutionData).Post);
 
                 foreach (var arg in (definition.Data.Execution as ContainerActionExecutionData).Arguments)
                 {
@@ -1549,7 +1777,7 @@ runs:
 name: 'Hello World'
 description: 'Greet the world and record the time'
 author: 'Test Corporation'
-inputs: 
+inputs:
   greeting: # id of input
     description: 'The greeting we choose - will print ""{greeting}, World!"" on stdout'
     required: true
@@ -1595,7 +1823,7 @@ runs:
 
                 Assert.NotNull((definition.Data.Execution as PluginActionExecutionData));
                 Assert.Equal("plugin.class, plugin", (definition.Data.Execution as PluginActionExecutionData).Plugin);
-                Assert.Equal("plugin.cleanup, plugin", (definition.Data.Execution as PluginActionExecutionData).Cleanup);
+                Assert.Equal("plugin.cleanup, plugin", (definition.Data.Execution as PluginActionExecutionData).Post);
             }
             finally
             {
@@ -1639,6 +1867,82 @@ runs:
             };
         }
 
+        /// <summary>
+        /// Creates a sample action in an archive on disk, similar to the archive
+        /// retrieved from GitHub's or GHES' repository API.
+        /// </summary>
+        /// <returns>The path on disk to the archive.</returns>
+#if OS_WINDOWS
+        private Task<string> CreateRepoArchive()
+#else
+        private async Task<string> CreateRepoArchive()
+#endif
+        {
+            const string Content = @"
+# Container action
+name: 'Hello World'
+description: 'Greet the world'
+author: 'GitHub'
+icon: 'hello.svg' # vector art to display in the GitHub Marketplace
+color: 'green' # optional, decorates the entry in the GitHub Marketplace
+runs:
+  using: 'node12'
+  main: 'task.js'
+";
+            CreateAction(yamlContent: Content, instance: out _, directory: out string directory);
+
+            var tempDir = _hc.GetDirectory(WellKnownDirectory.Temp);
+            Directory.CreateDirectory(tempDir);
+            var archiveFile = Path.Combine(tempDir, Path.GetRandomFileName());
+            var trace = _hc.GetTrace();
+
+#if OS_WINDOWS
+            ZipFile.CreateFromDirectory(directory, archiveFile, CompressionLevel.Fastest, includeBaseDirectory: true);
+            return Task.FromResult(archiveFile);
+#else
+            string tar = WhichUtil.Which("tar", require: true, trace: trace);
+
+            // tar -xzf
+            using (var processInvoker = new ProcessInvokerWrapper())
+            {
+                processInvoker.Initialize(_hc);
+                processInvoker.OutputDataReceived += new EventHandler<ProcessDataReceivedEventArgs>((sender, args) =>
+                {
+                    if (!string.IsNullOrEmpty(args.Data))
+                    {
+                        trace.Info(args.Data);
+                    }
+                });
+
+                processInvoker.ErrorDataReceived += new EventHandler<ProcessDataReceivedEventArgs>((sender, args) =>
+                {
+                    if (!string.IsNullOrEmpty(args.Data))
+                    {
+                        trace.Error(args.Data);
+                    }
+                });
+
+                string cwd = Path.GetDirectoryName(directory);
+                string inputDirectory = Path.GetFileName(directory);
+                int exitCode = await processInvoker.ExecuteAsync(_hc.GetDirectory(WellKnownDirectory.Bin), tar, $"-czf \"{archiveFile}\" -C \"{cwd}\" \"{inputDirectory}\"", null, CancellationToken.None);
+                if (exitCode != 0)
+                {
+                    throw new NotSupportedException($"Can't use 'tar -czf' to create archive file: {archiveFile}. return code: {exitCode}.");
+                }
+            }
+            return archiveFile;
+#endif
+        }
+
+        private static string GetLinkToActionArchive(string apiUrl, string repository, string @ref)
+        {
+#if OS_WINDOWS
+            return $"{apiUrl}/repos/{repository}/zipball/{@ref}";
+#else
+            return $"{apiUrl}/repos/{repository}/tarball/{@ref}";
+#endif
+        }
+
         private void Setup([CallerMemberName] string name = "")
         {
             _ecTokenSource?.Dispose();
@@ -1674,6 +1978,7 @@ runs:
             _hc.SetSingleton<IDockerCommandManager>(_dockerManager.Object);
             _hc.SetSingleton<IRunnerPluginManager>(_pluginManager.Object);
             _hc.SetSingleton<IActionManifestManager>(actionManifest);
+            _hc.SetSingleton<IHttpClientHandlerFactory>(new HttpClientHandlerFactory());
 
             _configurationStore = new Mock<IConfigurationStore>();
             _configurationStore

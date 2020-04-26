@@ -1,19 +1,18 @@
-﻿using GitHub.Runner.Common.Util;
-using System;
+﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.Diagnostics.Tracing;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Reflection;
 using System.Runtime.Loader;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Diagnostics;
-using System.Net.Http;
-using System.Diagnostics.Tracing;
 using GitHub.DistributedTask.Logging;
-using System.Net.Http.Headers;
 using GitHub.Runner.Sdk;
 
 namespace GitHub.Runner.Common
@@ -24,7 +23,7 @@ namespace GitHub.Runner.Common
         CancellationToken RunnerShutdownToken { get; }
         ShutdownReason RunnerShutdownReason { get; }
         ISecretMasker SecretMasker { get; }
-        ProductInfoHeaderValue UserAgent { get; }
+        List<ProductInfoHeaderValue> UserAgents { get; }
         RunnerWebProxy WebProxy { get; }
         string GetDirectory(WellKnownDirectory directory);
         string GetConfigFile(WellKnownConfigFile configFile);
@@ -54,7 +53,7 @@ namespace GitHub.Runner.Common
         private readonly ConcurrentDictionary<Type, object> _serviceInstances = new ConcurrentDictionary<Type, object>();
         private readonly ConcurrentDictionary<Type, Type> _serviceTypes = new ConcurrentDictionary<Type, Type>();
         private readonly ISecretMasker _secretMasker = new SecretMasker();
-        private readonly ProductInfoHeaderValue _userAgent = new ProductInfoHeaderValue($"GitHubActionsRunner-{BuildConstants.RunnerPackage.PackageName}", BuildConstants.RunnerPackage.Version);
+        private readonly List<ProductInfoHeaderValue> _userAgents = new List<ProductInfoHeaderValue>() { new ProductInfoHeaderValue($"GitHubActionsRunner-{BuildConstants.RunnerPackage.PackageName}", BuildConstants.RunnerPackage.Version) };
         private CancellationTokenSource _runnerShutdownTokenSource = new CancellationTokenSource();
         private object _perfLock = new object();
         private Tracing _trace;
@@ -72,7 +71,7 @@ namespace GitHub.Runner.Common
         public CancellationToken RunnerShutdownToken => _runnerShutdownTokenSource.Token;
         public ShutdownReason RunnerShutdownReason { get; private set; }
         public ISecretMasker SecretMasker => _secretMasker;
-        public ProductInfoHeaderValue UserAgent => _userAgent;
+        public List<ProductInfoHeaderValue> UserAgents => _userAgents;
         public RunnerWebProxy WebProxy => _webProxy;
         public HostContext(string hostType, string logFile = null)
         {
@@ -89,6 +88,7 @@ namespace GitHub.Runner.Common
             this.SecretMasker.AddValueEncoder(ValueEncoders.JsonStringEscape);
             this.SecretMasker.AddValueEncoder(ValueEncoders.UriDataEscape);
             this.SecretMasker.AddValueEncoder(ValueEncoders.XmlDataEscape);
+            this.SecretMasker.AddValueEncoder(ValueEncoders.TrimDoubleQuotes);
 
             // Create the trace manager.
             if (string.IsNullOrEmpty(logFile))
@@ -188,6 +188,17 @@ namespace GitHub.Runner.Common
             if (string.IsNullOrEmpty(WebProxy.HttpProxyAddress) && string.IsNullOrEmpty(WebProxy.HttpsProxyAddress))
             {
                 _trace.Info($"No proxy settings were found based on environmental variables (http_proxy/https_proxy/HTTP_PROXY/HTTPS_PROXY)");
+            }
+
+            var credFile = GetConfigFile(WellKnownConfigFile.Credentials);
+            if (File.Exists(credFile))
+            {
+                var credData = IOUtil.LoadObject<CredentialData>(credFile);
+                if (credData != null &&
+                    credData.Data.TryGetValue("clientId", out var clientId))
+                {
+                    _userAgents.Add(new ProductInfoHeaderValue($"RunnerId", clientId));
+                }
             }
         }
 
@@ -603,9 +614,8 @@ namespace GitHub.Runner.Common
     {
         public static HttpClientHandler CreateHttpClientHandler(this IHostContext context)
         {
-            HttpClientHandler clientHandler = new HttpClientHandler();
-            clientHandler.Proxy = context.WebProxy;
-            return clientHandler;
+            var handlerFactory = context.GetService<IHttpClientHandlerFactory>();
+            return handlerFactory.CreateClientHandler(context.WebProxy);
         }
     }
 

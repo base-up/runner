@@ -18,6 +18,7 @@ namespace GitHub.Runner.Worker
 {
     public enum ActionRunStage
     {
+        Pre,
         Main,
         Post,
     }
@@ -81,20 +82,18 @@ namespace GitHub.Runner.Worker
             ActionExecutionData handlerData = definition.Data?.Execution;
             ArgUtil.NotNull(handlerData, nameof(handlerData));
 
+            if (handlerData.HasPre &&
+                Action.Reference is Pipelines.RepositoryPathReference repoAction &&
+                string.Equals(repoAction.RepositoryType, Pipelines.PipelineConstants.SelfAlias, StringComparison.OrdinalIgnoreCase))
+            {
+                ExecutionContext.Warning($"`pre` execution is not supported for local action from '{repoAction.Path}'");
+            }
+
             // The action has post cleanup defined.
             // we need to create timeline record for them and add them to the step list that StepRunner is using
-            if (handlerData.HasCleanup && Stage == ActionRunStage.Main)
+            if (handlerData.HasPost && (Stage == ActionRunStage.Pre || Stage == ActionRunStage.Main))
             {
-                string postDisplayName = null;
-                if (this.DisplayName.StartsWith(PipelineTemplateConstants.RunDisplayPrefix))
-                {
-                    postDisplayName = $"Post {this.DisplayName.Substring(PipelineTemplateConstants.RunDisplayPrefix.Length)}";
-                }
-                else
-                {
-                    postDisplayName = $"Post {this.DisplayName}";
-                }
-
+                string postDisplayName = $"Post {this.DisplayName}";
                 var repositoryReference = Action.Reference as RepositoryPathReference;
                 var pathString = string.IsNullOrEmpty(repositoryReference.Path) ? string.Empty : $"/{repositoryReference.Path}";
                 var repoString = string.IsNullOrEmpty(repositoryReference.Ref) ? $"{repositoryReference.Name}{pathString}" :
@@ -108,7 +107,7 @@ namespace GitHub.Runner.Worker
                 actionRunner.Condition = handlerData.CleanupCondition;
                 actionRunner.DisplayName = postDisplayName;
 
-                ExecutionContext.RegisterPostJobStep($"{actionRunner.Action.Name}_post", actionRunner);
+                ExecutionContext.RegisterPostJobStep(actionRunner);
             }
 
             IStepHost stepHost = HostContext.CreateService<IDefaultStepHost>();
@@ -144,8 +143,10 @@ namespace GitHub.Runner.Worker
             var templateEvaluator = ExecutionContext.ToPipelineTemplateEvaluator();
             var inputs = templateEvaluator.EvaluateStepInputs(Action.Inputs, ExecutionContext.ExpressionValues, ExecutionContext.ExpressionFunctions);
 
+            var userInputs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (KeyValuePair<string, string> input in inputs)
             {
+                userInputs.Add(input.Key);
                 string message = "";
                 if (definition.Data?.Deprecated?.TryGetValue(input.Key, out message) == true)
                 {
@@ -153,17 +154,27 @@ namespace GitHub.Runner.Worker
                 }
             }
 
+            var validInputs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             // Merge the default inputs from the definition
             if (definition.Data?.Inputs != null)
             {
                 var manifestManager = HostContext.GetService<IActionManifestManager>();
-                foreach (var input in (definition.Data?.Inputs))
+                foreach (var input in definition.Data.Inputs)
                 {
                     string key = input.Key.AssertString("action input name").Value;
+                    validInputs.Add(key);
                     if (!inputs.ContainsKey(key))
                     {
                         inputs[key] = manifestManager.EvaluateDefaultInput(ExecutionContext, key, input.Value);
                     }
+                }
+            }
+
+            foreach (var input in userInputs)
+            {
+                if (!validInputs.Contains(input))
+                {
+                    ExecutionContext.Warning($"Unexpected input '{input}', valid inputs are ['{string.Join("', '", validInputs)}']");
                 }
             }
 

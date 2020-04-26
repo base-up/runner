@@ -94,8 +94,7 @@ namespace GitHub.Runner.Listener.Configuration
             {
                 // Get the URL
                 var inputUrl = command.GetUrl();
-                if (!inputUrl.Contains("github.com", StringComparison.OrdinalIgnoreCase) &&
-                    !inputUrl.Contains("github.localhost", StringComparison.OrdinalIgnoreCase))
+                if (inputUrl.Contains("codedev.ms", StringComparison.OrdinalIgnoreCase))
                 {
                     runnerSettings.ServerUrl = inputUrl;
                     // Get the credentials
@@ -116,7 +115,7 @@ namespace GitHub.Runner.Listener.Configuration
                 try
                 {
                     // Determine the service deployment type based on connection data. (Hosted/OnPremises)
-                    runnerSettings.IsHostedServer = await IsHostedServer(runnerSettings.ServerUrl, creds);
+                    runnerSettings.IsHostedServer = runnerSettings.GitHubUrl == null || IsHostedServer(new UriBuilder(runnerSettings.GitHubUrl));
 
                     // Validate can connect.
                     await _runnerServer.ConnectAsync(new Uri(runnerSettings.ServerUrl), creds);
@@ -167,6 +166,9 @@ namespace GitHub.Runner.Listener.Configuration
 
                 _term.WriteLine();
 
+                var userLabels = command.GetLabels();
+                _term.WriteLine();
+
                 var agents = await _runnerServer.GetAgentsAsync(runnerSettings.PoolId, runnerSettings.AgentName);
                 Trace.Verbose("Returns {0} agents", agents.Count);
                 agent = agents.FirstOrDefault();
@@ -176,7 +178,7 @@ namespace GitHub.Runner.Listener.Configuration
                     if (command.GetReplace())
                     {
                         // Update existing agent with new PublicKey, agent version.
-                        agent = UpdateExistingAgent(agent, publicKey);
+                        agent = UpdateExistingAgent(agent, publicKey, userLabels);
 
                         try
                         {
@@ -198,8 +200,8 @@ namespace GitHub.Runner.Listener.Configuration
                 }
                 else
                 {
-                    // Create a new agent. 
-                    agent = CreateNewAgent(runnerSettings.AgentName, publicKey);
+                    // Create a new agent.
+                    agent = CreateNewAgent(runnerSettings.AgentName, publicKey, userLabels);
 
                     try
                     {
@@ -247,14 +249,6 @@ namespace GitHub.Runner.Listener.Configuration
             {
                 UriBuilder configServerUrl = new UriBuilder(runnerSettings.ServerUrl);
                 UriBuilder oauthEndpointUrlBuilder = new UriBuilder(agent.Authorization.AuthorizationUrl);
-                if (!runnerSettings.IsHostedServer && Uri.Compare(configServerUrl.Uri, oauthEndpointUrlBuilder.Uri, UriComponents.SchemeAndServer, UriFormat.Unescaped, StringComparison.OrdinalIgnoreCase) != 0)
-                {
-                    oauthEndpointUrlBuilder.Scheme = configServerUrl.Scheme;
-                    oauthEndpointUrlBuilder.Host = configServerUrl.Host;
-                    oauthEndpointUrlBuilder.Port = configServerUrl.Port;
-                    Trace.Info($"Set oauth endpoint url's scheme://host:port component to match runner configure url's scheme://host:port: '{oauthEndpointUrlBuilder.Uri.AbsoluteUri}'.");
-                }
-
                 var credentialData = new CredentialData
                 {
                     Scheme = Constants.Configuration.OAuth,
@@ -290,7 +284,7 @@ namespace GitHub.Runner.Listener.Configuration
             {
                 // there are two exception messages server send that indicate clock skew.
                 // 1. The bearer token expired on {jwt.ValidTo}. Current server time is {DateTime.UtcNow}.
-                // 2. The bearer token is not valid until {jwt.ValidFrom}. Current server time is {DateTime.UtcNow}.                
+                // 2. The bearer token is not valid until {jwt.ValidFrom}. Current server time is {DateTime.UtcNow}.
                 Trace.Error("Catch exception during test agent connection.");
                 Trace.Error(ex);
                 throw new Exception("The local machine's clock may be out of sync with the server time by more than five minutes. Please sync your clock with your domain or internet time and try again.");
@@ -402,7 +396,7 @@ namespace GitHub.Runner.Listener.Configuration
                     _term.WriteLine("Cannot connect to server, because config files are missing. Skipping removing runner from the server.");
                 }
 
-                //delete credential config files               
+                //delete credential config files
                 currentAction = "Removing .credentials";
                 if (hasCredentials)
                 {
@@ -416,7 +410,7 @@ namespace GitHub.Runner.Listener.Configuration
                     _term.WriteLine("Does not exist. Skipping " + currentAction);
                 }
 
-                //delete settings config file                
+                //delete settings config file
                 currentAction = "Removing .runner";
                 if (isConfigured)
                 {
@@ -457,7 +451,7 @@ namespace GitHub.Runner.Listener.Configuration
         }
 
 
-        private TaskAgent UpdateExistingAgent(TaskAgent agent, RSAParameters publicKey)
+        private TaskAgent UpdateExistingAgent(TaskAgent agent, RSAParameters publicKey, ISet<string> userLabels)
         {
             ArgUtil.NotNull(agent, nameof(agent));
             agent.Authorization = new TaskAgentAuthorization
@@ -465,18 +459,25 @@ namespace GitHub.Runner.Listener.Configuration
                 PublicKey = new TaskAgentPublicKey(publicKey.Exponent, publicKey.Modulus),
             };
 
-            // update - update instead of delete so we don't lose labels etc...
+            // update should replace the existing labels
             agent.Version = BuildConstants.RunnerPackage.Version;
             agent.OSDescription = RuntimeInformation.OSDescription;
+            
+            agent.Labels.Clear();
 
-            agent.Labels.Add("self-hosted");
-            agent.Labels.Add(VarUtil.OS);
-            agent.Labels.Add(VarUtil.OSArchitecture);
+            agent.Labels.Add(new AgentLabel("self-hosted", LabelType.System));
+            agent.Labels.Add(new AgentLabel(VarUtil.OS, LabelType.System));
+            agent.Labels.Add(new AgentLabel(VarUtil.OSArchitecture, LabelType.System));
 
+            foreach (var userLabel in userLabels)
+            {
+                agent.Labels.Add(new AgentLabel(userLabel, LabelType.User));
+            }
+            
             return agent;
         }
 
-        private TaskAgent CreateNewAgent(string agentName, RSAParameters publicKey)
+        private TaskAgent CreateNewAgent(string agentName, RSAParameters publicKey, ISet<string> userLabels)
         {
             TaskAgent agent = new TaskAgent(agentName)
             {
@@ -489,43 +490,43 @@ namespace GitHub.Runner.Listener.Configuration
                 OSDescription = RuntimeInformation.OSDescription,
             };
 
-            agent.Labels.Add("self-hosted");
-            agent.Labels.Add(VarUtil.OS);
-            agent.Labels.Add(VarUtil.OSArchitecture);
+            agent.Labels.Add(new AgentLabel("self-hosted", LabelType.System));
+            agent.Labels.Add(new AgentLabel(VarUtil.OS, LabelType.System));
+            agent.Labels.Add(new AgentLabel(VarUtil.OSArchitecture, LabelType.System));
+
+            foreach (var userLabel in userLabels)
+            {
+                agent.Labels.Add(new AgentLabel(userLabel, LabelType.User));
+            }
 
             return agent;
         }
 
-        private async Task<bool> IsHostedServer(string serverUrl, VssCredentials credentials)
+        private bool IsHostedServer(UriBuilder gitHubUrl)
         {
-            // Determine the service deployment type based on connection data. (Hosted/OnPremises)
-            var locationServer = HostContext.GetService<ILocationServer>();
-            VssConnection connection = VssUtil.CreateConnection(new Uri(serverUrl), credentials);
-            await locationServer.ConnectAsync(connection);
-            try
-            {
-                var connectionData = await locationServer.GetConnectionDataAsync();
-                Trace.Info($"Server deployment type: {connectionData.DeploymentType}");
-                return connectionData.DeploymentType.HasFlag(DeploymentFlags.Hosted);
-            }
-            catch (Exception ex)
-            {
-                // Since the DeploymentType is Enum, deserialization exception means there is a new Enum member been added.
-                // It's more likely to be Hosted since OnPremises is always behind and customer can update their agent if are on-prem
-                Trace.Error(ex);
-                return true;
-            }
+            return string.Equals(gitHubUrl.Host, "github.com", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(gitHubUrl.Host, "www.github.com", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(gitHubUrl.Host, "github.localhost", StringComparison.OrdinalIgnoreCase);
         }
 
         private async Task<GitHubAuthResult> GetTenantCredential(string githubUrl, string githubToken, string runnerEvent)
         {
+            var githubApiUrl = "";
             var gitHubUrlBuilder = new UriBuilder(githubUrl);
-            var githubApiUrl = $"{gitHubUrlBuilder.Scheme}://api.{gitHubUrlBuilder.Host}/actions/runner-registration";
+            if (IsHostedServer(gitHubUrlBuilder))
+            {
+                githubApiUrl = $"{gitHubUrlBuilder.Scheme}://api.{gitHubUrlBuilder.Host}/actions/runner-registration";
+            }
+            else
+            {
+                githubApiUrl = $"{gitHubUrlBuilder.Scheme}://{gitHubUrlBuilder.Host}/api/v3/actions/runner-registration";
+            }
+
             using (var httpClientHandler = HostContext.CreateHttpClientHandler())
             using (var httpClient = new HttpClient(httpClientHandler))
             {
                 httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("RemoteAuth", githubToken);
-                httpClient.DefaultRequestHeaders.UserAgent.Add(HostContext.UserAgent);
+                httpClient.DefaultRequestHeaders.UserAgent.AddRange(HostContext.UserAgents);
 
                 var bodyObject = new Dictionary<string, string>()
                 {

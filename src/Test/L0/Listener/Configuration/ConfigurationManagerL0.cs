@@ -37,7 +37,7 @@ namespace GitHub.Runner.Common.Tests.Listener.Configuration
 
         private Mock<IRSAKeyManager> _rsaKeyManager;
         private string _expectedToken = "expectedToken";
-        private string _expectedServerUrl = "https://localhost";
+        private string _expectedServerUrl = "https://codedev.ms";
         private string _expectedAgentName = "expectedAgentName";
         private string _expectedPoolName = "poolName";
         private string _expectedAuthType = "pat";
@@ -145,6 +145,8 @@ namespace GitHub.Runner.Common.Tests.Listener.Configuration
                 IConfigurationManager configManager = new ConfigurationManager();
                 configManager.Initialize(tc);
 
+                var userLabels = "userlabel1,userlabel2";
+
                 trace.Info("Preparing command line arguments");
                 var command = new CommandSettings(
                     tc,
@@ -156,7 +158,8 @@ namespace GitHub.Runner.Common.Tests.Listener.Configuration
                        "--pool", _expectedPoolName,
                        "--work", _expectedWorkFolder,
                        "--auth", _expectedAuthType,
-                       "--token", _expectedToken
+                       "--token", _expectedToken,
+                       "--labels", userLabels
                     });
                 trace.Info("Constructed.");
                 _store.Setup(x => x.IsConfigured()).Returns(false);
@@ -178,7 +181,10 @@ namespace GitHub.Runner.Common.Tests.Listener.Configuration
                 // validate GetAgentPoolsAsync gets called twice with automation pool type
                 _runnerServer.Verify(x => x.GetAgentPoolsAsync(It.IsAny<string>(), It.Is<TaskAgentPoolType>(p => p == TaskAgentPoolType.Automation)), Times.Exactly(2));
 
-                _runnerServer.Verify(x => x.AddAgentAsync(It.IsAny<int>(), It.Is<TaskAgent>(a => a.Labels.Contains("self-hosted") && a.Labels.Contains(VarUtil.OS) && a.Labels.Contains(VarUtil.OSArchitecture))), Times.Once);
+                var expectedLabels = new List<string>() { "self-hosted", VarUtil.OS, VarUtil.OSArchitecture};
+                expectedLabels.AddRange(userLabels.Split(",").ToList());
+
+                _runnerServer.Verify(x => x.AddAgentAsync(It.IsAny<int>(), It.Is<TaskAgent>(a => a.Labels.Select(x => x.Name).ToHashSet().SetEquals(expectedLabels))), Times.Once);
             }
         }
     }
